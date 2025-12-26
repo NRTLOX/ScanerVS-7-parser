@@ -1149,24 +1149,130 @@ class VulnParserApp:
 
         self.log(f"📁 Объединяю .xlsx из папки: {folder}")
         try:
-            dfs = []
+            all_data = []  # Будем хранить все данные
+            file_paths = []  # Для отслеживания источников
+            
+            # Читаем все файлы
             for filename in os.listdir(folder):
                 if filename.endswith(".xlsx"):
                     path = os.path.join(folder, filename)
-                    df = pd.read_excel(path)
-                    dfs.append(df)
-
-            if not dfs:
+                    self.log(f"📄 Читаю файл: {filename}")
+                    
+                    try:
+                        df = pd.read_excel(path)
+                        # Добавляем столбец с именем файла для отладки
+                        df['source_file'] = filename
+                        all_data.append(df)
+                        file_paths.append(path)
+                    except Exception as e:
+                        self.log(f"⚠️ Ошибка чтения файла {filename}: {e}")
+                        continue
+            
+            if not all_data:
                 self.log("❌ Нет .xlsx файлов в папке.")
                 return
-
-            merged_df = pd.concat(dfs, ignore_index=True)
-            deduplicated_df = merged_df.drop_duplicates(subset=merged_df.columns[0], keep='first')
+            
+            self.log(f"✅ Прочитано файлов: {len(all_data)}")
+            
+            # Объединяем все данные
+            merged_df = pd.concat(all_data, ignore_index=True)
+            
+            # Проверяем структуру данных
+            self.log(f"📊 Столбцы в объединенном датафрейме: {list(merged_df.columns)}")
+            self.log(f"📈 Всего строк до обработки: {len(merged_df)}")
+            
+            if len(merged_df.columns) < 4:
+                self.log("❌ Файлы должны содержать минимум 4 столбца")
+                return
+            
+            # Проверяем названия столбцов
+            first_col_name = merged_df.columns[0]
+            fourth_col_name = merged_df.columns[3] if len(merged_df.columns) > 3 else "Компонент"
+            
+            self.log(f"🔍 Первый столбец: '{first_col_name}', Четвертый столбец: '{fourth_col_name}'")
+            
+            # Проверяем наличие дубликатов по первому столбцу
+            duplicates = merged_df.duplicated(subset=[first_col_name], keep=False)
+            duplicate_count = duplicates.sum()
+            
+            if duplicate_count > 0:
+                self.log(f"🔍 Найдено дубликатов по первому столбцу: {duplicate_count}")
+                
+                # Создаем словарь для хранения данных
+                result_rows = {}
+                
+                # Обрабатываем каждую строку
+                for idx, row in merged_df.iterrows():
+                    key = str(row[first_col_name]).strip() if pd.notna(row[first_col_name]) else f"empty_{idx}"
+                    
+                    if key not in result_rows:
+                        # Первое вхождение - сохраняем всю строку
+                        result_rows[key] = {
+                            'row': row.tolist(),
+                            'components': {str(row[fourth_col_name]).strip()} if pd.notna(row[fourth_col_name]) else set(),
+                            'files': {row['source_file']}
+                        }
+                    else:
+                        # Дубликат - объединяем компоненты
+                        if pd.notna(row[fourth_col_name]):
+                            component = str(row[fourth_col_name]).strip()
+                            result_rows[key]['components'].add(component)
+                        result_rows[key]['files'].add(row['source_file'])
+                
+                # Формируем новый датафрейм
+                processed_rows = []
+                for key, data in result_rows.items():
+                    row_data = data['row'][:4]  # Первые 4 столбца
+                    
+                    # Объединяем компоненты через запятую
+                    if data['components']:
+                        combined_components = ', '.join(sorted(data['components']))
+                    else:
+                        combined_components = ''
+                    
+                    # Заменяем четвертый столбец на объединенные компоненты
+                    if len(row_data) > 3:
+                        row_data[3] = combined_components
+                    
+                    # Добавляем остальные столбцы (если есть)
+                    if len(data['row']) > 4:
+                        row_data.extend(data['row'][4:])
+                    
+                    processed_rows.append(row_data)
+                
+                # Создаем новый датафрейм
+                columns = list(merged_df.columns)
+                result_df = pd.DataFrame(processed_rows, columns=columns)
+                
+            else:
+                self.log("ℹ️ Дубликатов не найдено, оставляю данные как есть")
+                result_df = merged_df.drop(columns=['source_file'])  # Удаляем служебный столбец
+            
+            # Сохраняем результат
             out_path = os.path.join(folder, "merged_deduplicated.xlsx")
-            deduplicated_df.to_excel(out_path, index=False)
+            
+            # Удаляем служебный столбец если он есть
+            if 'source_file' in result_df.columns:
+                result_df = result_df.drop(columns=['source_file'])
+            
+            result_df.to_excel(out_path, index=False)
+            
             self.log(f"✅ Результат сохранён: {out_path}")
+            self.log(f"📈 Итоговое количество строк: {len(result_df)}")
+            
+            # Показываем пример результата
+            if len(result_df) > 0:
+                self.log("📋 Пример результата (первые 3 строки):")
+                for i in range(min(3, len(result_df))):
+                    row = result_df.iloc[i]
+                    cve = row.iloc[0] if pd.notna(row.iloc[0]) else "N/A"
+                    component = row.iloc[3] if len(row) > 3 and pd.notna(row.iloc[3]) else "N/A"
+                    self.log(f"  {i+1}. {cve} -> Компоненты: {component}")
+            
         except Exception as e:
             self.log(f"❌ Ошибка объединения: {e}")
+            import traceback
+            self.log(f"❌ Трассировка: {traceback.format_exc()}")
 
     def parse_dpkg_line(self, line):
         parts = line.strip().split()
